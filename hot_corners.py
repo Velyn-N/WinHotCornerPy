@@ -2,11 +2,12 @@
 GNOME-style top-left hot corners for Windows.
 
 The default runtime model is a tray-controlled background utility. A tray icon
-allows enabling/disabling the engine, reloading configuration, opening the local
-config file, and quitting the application.
+allows enabling/disabling the engine, reloading configuration, opening the
+local config file, opening logs, viewing recovery instructions, configuring
+startup integration, and quitting the application.
 
-Configuration is loaded from `hot_corners_config.json` in the same directory if
-the file exists. Any missing or invalid values fall back to safe defaults.
+Configuration is loaded from `.runtime/hot_corners_config.json` if the file
+exists. Any missing or invalid values fall back to safe defaults.
 """
 
 from __future__ import annotations
@@ -18,36 +19,60 @@ import json
 import logging
 import os
 import queue
+import signal
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
-CONFIG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "hot_corners_config.json",
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+README_PATH = os.path.join(APP_DIR, "README.md")
+RUNTIME_DIR = os.path.join(APP_DIR, ".runtime")
+CONFIG_PATH = os.path.join(RUNTIME_DIR, "hot_corners_config.json")
+LOG_PATH = os.path.join(RUNTIME_DIR, "hot_corners.log")
+PID_PATH = os.path.join(RUNTIME_DIR, "hot_corners.pid")
+
+APPDATA_DIR = os.environ.get("APPDATA", "")
+START_MENU_PROGRAMS_DIR = os.path.join(
+    APPDATA_DIR,
+    "Microsoft",
+    "Windows",
+    "Start Menu",
+    "Programs",
 )
-LOG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "hot_corners.log",
-)
+STARTUP_DIR = os.path.join(START_MENU_PROGRAMS_DIR, "Startup")
+STARTUP_SCRIPT_PATH = os.path.join(STARTUP_DIR, "HotCornerPy Startup.cmd")
+RECOVERY_SCRIPT_PATH = os.path.join(START_MENU_PROGRAMS_DIR, "HotCornerPy Emergency Stop.cmd")
+FALLBACK_RECOVERY_SCRIPT_PATH = os.path.join(RUNTIME_DIR, "hot_corners_emergency_stop.cmd")
 
 WH_MOUSE_LL = 14
 HC_ACTION = 0
 
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP = 0x0202
 WM_RBUTTONDOWN = 0x0204
-WM_RBUTTONUP = 0x0205
 WM_MBUTTONDOWN = 0x0207
-WM_MBUTTONUP = 0x0208
 WM_QUIT = 0x0012
+WM_HOTKEY = 0x0312
 
 KEYEVENTF_KEYUP = 0x0002
 VK_LWIN = 0x5B
 VK_TAB = 0x09
+VK_F11 = 0x7A
+VK_F12 = 0x7B
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_NOREPEAT = 0x4000
+
+EMERGENCY_DISABLE_HOTKEY_ID = 1
+EMERGENCY_QUIT_HOTKEY_ID = 2
+EMERGENCY_QUIT_HOTKEY_TEXT = "Ctrl+Alt+Shift+F11"
+EMERGENCY_DISABLE_HOTKEY_TEXT = "Ctrl+Alt+Shift+F12"
 
 LRESULT = ctypes.c_ssize_t
 ULONG_PTR = ctypes.c_size_t
@@ -65,6 +90,7 @@ DEFAULTS = {
     "cooldown_ms": 400,
     "click_suppression_ms": 150,
     "monitor_refresh_ms": 300000,
+    "startup_delay_ms": 30000,
     "max_callback_errors": 5,
 }
 
@@ -76,6 +102,7 @@ CONFIG_BOUNDS = {
     "cooldown_ms": (0, 10000),
     "click_suppression_ms": (0, 5000),
     "monitor_refresh_ms": (250, 3600000),
+    "startup_delay_ms": (0, 600000),
     "max_callback_errors": (1, 100),
 }
 
@@ -209,8 +236,32 @@ user32.keybd_event.argtypes = [
 ]
 user32.keybd_event.restype = None
 
+user32.RegisterHotKey.argtypes = [
+    ctypes.wintypes.HWND,
+    ctypes.c_int,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.UINT,
+]
+user32.RegisterHotKey.restype = ctypes.wintypes.BOOL
+
+user32.UnregisterHotKey.argtypes = [
+    ctypes.wintypes.HWND,
+    ctypes.c_int,
+]
+user32.UnregisterHotKey.restype = ctypes.wintypes.BOOL
+
 kernel32.GetCurrentThreadId.argtypes = []
 kernel32.GetCurrentThreadId.restype = ctypes.wintypes.DWORD
+
+HANDLER_ROUTINE = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+kernel32.SetConsoleCtrlHandler.argtypes = [HANDLER_ROUTINE, ctypes.wintypes.BOOL]
+kernel32.SetConsoleCtrlHandler.restype = ctypes.wintypes.BOOL
+
+CTRL_C_EVENT = 0
+CTRL_BREAK_EVENT = 1
+CTRL_CLOSE_EVENT = 2
+CTRL_LOGOFF_EVENT = 5
+CTRL_SHUTDOWN_EVENT = 6
 
 
 @dataclass(frozen=True)
@@ -222,6 +273,7 @@ class Config:
     cooldown_ms: int
     click_suppression_ms: int
     monitor_refresh_ms: int
+    startup_delay_ms: int
     max_callback_errors: int
 
 
@@ -254,6 +306,152 @@ class CornerVisitState:
     last_click_ms: int = 0
 
 
+def preferred_python_executable(gui: bool) -> str:
+    executable = os.path.abspath(sys.executable)
+    directory = os.path.dirname(executable)
+    filename = os.path.basename(executable).lower()
+
+    if gui and filename == "python.exe":
+        candidate = os.path.join(directory, "pythonw.exe")
+        if os.path.exists(candidate):
+            return candidate
+    if not gui and filename == "pythonw.exe":
+        candidate = os.path.join(directory, "python.exe")
+        if os.path.exists(candidate):
+            return candidate
+    return executable
+
+
+def quote_cmd(value: str) -> str:
+    return subprocess.list2cmdline([value])
+
+
+def ensure_runtime_dir() -> None:
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+
+
+class WindowsIntegration:
+    def __init__(self) -> None:
+        self.gui_python = preferred_python_executable(gui=True)
+        self.console_python = preferred_python_executable(gui=False)
+        self.script_path = os.path.abspath(__file__)
+        self.recovery_script_path = RECOVERY_SCRIPT_PATH
+
+    @staticmethod
+    def ensure_log_file() -> None:
+        ensure_runtime_dir()
+        if os.path.exists(LOG_PATH):
+            return
+        with open(LOG_PATH, "a", encoding="utf-8"):
+            pass
+
+    def open_log_file(self) -> None:
+        self.ensure_log_file()
+        os.startfile(LOG_PATH)
+
+    @staticmethod
+    def open_readme() -> None:
+        os.startfile(README_PATH)
+
+    def is_startup_enabled(self) -> bool:
+        return os.path.exists(STARTUP_SCRIPT_PATH)
+
+    def enable_startup(self) -> None:
+        os.makedirs(STARTUP_DIR, exist_ok=True)
+        command = (
+            f"@echo off\r\n"
+            f"{quote_cmd(self.gui_python)} {quote_cmd(self.script_path)} --startup-launch\r\n"
+        )
+        with open(STARTUP_SCRIPT_PATH, "w", encoding="utf-8", newline="") as handle:
+            handle.write(command)
+        logging.info("Enabled startup launcher at %s", STARTUP_SCRIPT_PATH)
+
+    def disable_startup(self) -> None:
+        try:
+            os.remove(STARTUP_SCRIPT_PATH)
+            logging.info("Disabled startup launcher")
+        except FileNotFoundError:
+            pass
+
+    def ensure_recovery_artifacts(self) -> None:
+        ensure_runtime_dir()
+        recovery_script = (
+            f"@echo off\r\n"
+            f"{quote_cmd(self.console_python)} {quote_cmd(self.script_path)} --panic-stop\r\n"
+        )
+
+        with open(FALLBACK_RECOVERY_SCRIPT_PATH, "w", encoding="utf-8", newline="") as handle:
+            handle.write(recovery_script)
+
+        target_path = FALLBACK_RECOVERY_SCRIPT_PATH
+        try:
+            os.makedirs(START_MENU_PROGRAMS_DIR, exist_ok=True)
+            with open(RECOVERY_SCRIPT_PATH, "w", encoding="utf-8", newline="") as handle:
+                handle.write(recovery_script)
+            target_path = RECOVERY_SCRIPT_PATH
+        except OSError:
+            pass
+
+        self.recovery_script_path = target_path
+
+
+def write_pid_file() -> None:
+    ensure_runtime_dir()
+    with open(PID_PATH, "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+
+def remove_pid_file() -> None:
+    try:
+        os.remove(PID_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def panic_stop_running_instance() -> int:
+    try:
+        with open(PID_PATH, "r", encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+    except (FileNotFoundError, ValueError):
+        return 1
+
+    if pid == os.getpid():
+        return 1
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return 0
+    except OSError:
+        completed = subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return completed.returncode
+
+
+def install_console_ctrl_handler(handler: Callable[[int], None]) -> HANDLER_ROUTINE:
+    relevant_events = {
+        CTRL_C_EVENT,
+        CTRL_BREAK_EVENT,
+        CTRL_CLOSE_EVENT,
+        CTRL_LOGOFF_EVENT,
+        CTRL_SHUTDOWN_EVENT,
+    }
+
+    @HANDLER_ROUTINE
+    def console_handler(ctrl_type: int) -> bool:
+        if ctrl_type not in relevant_events:
+            return False
+        threading.Thread(target=handler, args=(int(ctrl_type),), daemon=True).start()
+        return True
+
+    if not kernel32.SetConsoleCtrlHandler(console_handler, True):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return console_handler
+
+
 class HotCornersEngine:
     def __init__(self, dry_run: bool) -> None:
         self.dry_run = dry_run
@@ -274,6 +472,8 @@ class HotCornersEngine:
         self.running = False
         self.enabled = False
         self.threads: List[threading.Thread] = []
+        self.state_change_callback: Optional[Callable[[], None]] = None
+        self.quit_request_callback: Optional[Callable[[], None]] = None
 
         self.stop_event = threading.Event()
         self.trigger_event = threading.Event()
@@ -281,6 +481,7 @@ class HotCornersEngine:
         self.hook_handle = HHOOK()
         self.hook_callback = HOOKPROC(self._mouse_proc)
         self.hook_thread_id = 0
+        self.hotkey_thread_id = 0
 
     @staticmethod
     def _now_ms() -> int:
@@ -293,6 +494,7 @@ class HotCornersEngine:
         self.threads = []
         self.hook_handle = HHOOK()
         self.hook_thread_id = 0
+        self.hotkey_thread_id = 0
         self.last_position = None
         self.last_global_trigger_ms = 0
         self.awaiting_corner_exit = False
@@ -301,6 +503,7 @@ class HotCornersEngine:
         self.failure_reason = None
 
     def _load_config(self) -> Config:
+        ensure_runtime_dir()
         values = dict(DEFAULTS)
         if os.path.exists(CONFIG_PATH):
             try:
@@ -351,6 +554,7 @@ class HotCornersEngine:
         logging.info("Configuration loaded: %s", config)
 
     def ensure_config_file(self) -> None:
+        ensure_runtime_dir()
         if os.path.exists(CONFIG_PATH):
             return
         with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
@@ -370,6 +574,32 @@ class HotCornersEngine:
         with self.state_lock:
             return self.running
 
+    def set_state_change_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        with self.state_lock:
+            self.state_change_callback = callback
+
+    def set_quit_request_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        with self.state_lock:
+            self.quit_request_callback = callback
+
+    def _notify_state_change(self) -> None:
+        with self.state_lock:
+            callback = self.state_change_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                logging.exception("State change callback failed")
+
+    def _notify_quit_requested(self) -> None:
+        with self.state_lock:
+            callback = self.quit_request_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                logging.exception("Quit request callback failed")
+
     def status_text(self) -> str:
         with self.state_lock:
             if self.enabled and self.running:
@@ -378,18 +608,24 @@ class HotCornersEngine:
                 return f"Disabled ({self.failure_reason})"
             return "Disabled"
 
+    def startup_delay_seconds(self) -> float:
+        with self.state_lock:
+            return self.config.startup_delay_ms / 1000.0
+
     def enable(self) -> None:
         with self.state_lock:
             if self.enabled:
                 return
             self.enabled = True
         self.start()
+        self._notify_state_change()
 
     def disable(self, reason: str = "disabled") -> None:
         with self.state_lock:
             self.enabled = False
             self.failure_reason = reason
         self.stop()
+        self._notify_state_change()
 
     def start(self) -> None:
         with self.state_lock:
@@ -406,6 +642,7 @@ class HotCornersEngine:
             threading.Thread(target=self._action_loop, name="action-worker", daemon=True),
             threading.Thread(target=self._trigger_loop, name="trigger-worker", daemon=True),
             threading.Thread(target=self._monitor_refresh_loop, name="monitor-refresh", daemon=True),
+            threading.Thread(target=self._run_hotkey_loop, name="emergency-hotkey", daemon=True),
             threading.Thread(target=self._run_hook_loop, name="mouse-hook", daemon=True),
         ]
         for thread in self.threads:
@@ -420,6 +657,7 @@ class HotCornersEngine:
             self.enabled = False
             self.failure_reason = None
         self._request_stop(join=True)
+        self._notify_state_change()
 
     def _request_stop(self, join: bool) -> None:
         with self.state_lock:
@@ -431,16 +669,23 @@ class HotCornersEngine:
         self.action_queue.put("stop")
         if self.hook_thread_id:
             user32.PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0)
+        if self.hotkey_thread_id:
+            user32.PostThreadMessageW(self.hotkey_thread_id, WM_QUIT, 0, 0)
 
         if join:
             current = threading.current_thread()
+            deadline = time.monotonic() + 1.0
             for thread in self.threads:
                 if thread is current:
                     continue
-                thread.join(timeout=2.0)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(timeout=remaining)
             with self.state_lock:
                 self.running = False
             logging.info("Hot corners engine stopped")
+            self._notify_state_change()
 
     def _request_stop_async(self) -> None:
         threading.Thread(target=self._request_stop, args=(True,), daemon=True).start()
@@ -494,6 +739,7 @@ class HotCornersEngine:
                 self.enabled = False
                 self.failure_reason = "hook fault"
             self._request_stop_async()
+            self._notify_state_change()
 
     def _find_monitor_for_point(self, x: int, y: int, config: Config) -> Optional[MonitorCorner]:
         for monitor in self.monitors:
@@ -588,7 +834,7 @@ class HotCornersEngine:
             except Exception as exc:
                 self._record_callback_fault(exc)
 
-        return user32.CallNextHookEx(self.hook_handle, n_code, w_param, lParam:=l_param)
+        return user32.CallNextHookEx(self.hook_handle, n_code, w_param, l_param)
 
     def _run_hook_loop(self) -> None:
         try:
@@ -613,11 +859,62 @@ class HotCornersEngine:
                 self.enabled = False
                 self.failure_reason = "hook loop failed"
             self._request_stop_async()
+            self._notify_state_change()
         finally:
             if self.hook_handle:
                 user32.UnhookWindowsHookEx(self.hook_handle)
                 self.hook_handle = HHOOK()
                 logging.info("Mouse hook removed")
+
+    def _run_hotkey_loop(self) -> None:
+        self.hotkey_thread_id = kernel32.GetCurrentThreadId()
+        disable_registered = user32.RegisterHotKey(
+            None,
+            EMERGENCY_DISABLE_HOTKEY_ID,
+            MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+            VK_F12,
+        )
+        quit_registered = user32.RegisterHotKey(
+            None,
+            EMERGENCY_QUIT_HOTKEY_ID,
+            MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+            VK_F11,
+        )
+        if not disable_registered:
+            logging.warning("Failed to register emergency hotkey %s", EMERGENCY_DISABLE_HOTKEY_TEXT)
+        else:
+            logging.info("Emergency disable hotkey registered: %s", EMERGENCY_DISABLE_HOTKEY_TEXT)
+        if not quit_registered:
+            logging.warning("Failed to register emergency hotkey %s", EMERGENCY_QUIT_HOTKEY_TEXT)
+        else:
+            logging.info("Emergency quit hotkey registered: %s", EMERGENCY_QUIT_HOTKEY_TEXT)
+        if not disable_registered and not quit_registered:
+            return
+
+        try:
+            msg = MSG()
+            while not self.stop_event.is_set():
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result == -1:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if result == 0 or msg.message == WM_QUIT:
+                    break
+                if msg.message != WM_HOTKEY:
+                    continue
+                if msg.wParam == EMERGENCY_DISABLE_HOTKEY_ID:
+                    logging.warning("Emergency disable hotkey triggered")
+                    self.disable("emergency hotkey")
+                elif msg.wParam == EMERGENCY_QUIT_HOTKEY_ID:
+                    logging.warning("Emergency quit hotkey triggered")
+                    self.shutdown()
+                    self._notify_quit_requested()
+        except Exception as exc:
+            logging.exception("Emergency hotkey loop failed: %s", exc)
+        finally:
+            if disable_registered:
+                user32.UnregisterHotKey(None, EMERGENCY_DISABLE_HOTKEY_ID)
+            if quit_registered:
+                user32.UnregisterHotKey(None, EMERGENCY_QUIT_HOTKEY_ID)
 
     def _monitor_refresh_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -691,22 +988,33 @@ class HotCornersEngine:
 
 
 class TrayController:
-    def __init__(self, engine: HotCornersEngine, auto_quit_after: Optional[float]) -> None:
+    def __init__(
+        self,
+        engine: HotCornersEngine,
+        integration: WindowsIntegration,
+        auto_quit_after: Optional[float],
+    ) -> None:
         self.engine = engine
+        self.integration = integration
         self.auto_quit_after = auto_quit_after
         self.icon = None
 
     def run(self) -> None:
         import pystray
 
+        self.engine.set_state_change_callback(self._handle_engine_state_change)
+        self.engine.set_quit_request_callback(self._handle_quit_request)
         self.icon = pystray.Icon(
             "HotCornerPy",
             self._build_icon_image(),
             self._title(),
             menu=pystray.Menu(
                 pystray.MenuItem(self._toggle_text, self._toggle_enabled),
+                pystray.MenuItem(self._startup_text, self._toggle_startup),
                 pystray.MenuItem("Reload Config", self._reload_config),
                 pystray.MenuItem("Open Config File", self._open_config),
+                pystray.MenuItem("Open Log File", self._open_logs),
+                pystray.MenuItem("Open README", self._open_readme),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Quit", self._quit),
             ),
@@ -741,16 +1049,38 @@ class TrayController:
         icon.title = self._title()
         icon.update_menu()
 
+    def _handle_engine_state_change(self) -> None:
+        if self.icon is not None:
+            self._refresh_ui(self.icon)
+
+    def _handle_quit_request(self) -> None:
+        self.engine.set_state_change_callback(None)
+        self.engine.set_quit_request_callback(None)
+        if self.icon is not None:
+            self.icon.stop()
+
     def _toggle_text(self, _item) -> str:
         if self.engine.is_enabled():
             return "Disable Hot Corners"
         return "Enable Hot Corners"
+
+    def _startup_text(self, _item) -> str:
+        if self.integration.is_startup_enabled():
+            return "Disable Startup"
+        return "Enable Startup"
 
     def _toggle_enabled(self, icon, _item=None) -> None:
         if self.engine.is_enabled():
             self.engine.disable("disabled by user")
         else:
             self.engine.enable()
+        self._refresh_ui(icon)
+
+    def _toggle_startup(self, icon, _item=None) -> None:
+        if self.integration.is_startup_enabled():
+            self.integration.disable_startup()
+        else:
+            self.integration.enable_startup()
         self._refresh_ui(icon)
 
     def _reload_config(self, icon, _item=None) -> None:
@@ -764,9 +1094,29 @@ class TrayController:
             logging.exception("Failed to open config file: %s", exc)
         self._refresh_ui(icon)
 
+    def _open_logs(self, icon, _item=None) -> None:
+        try:
+            self.integration.open_log_file()
+        except Exception as exc:
+            logging.exception("Failed to open log file: %s", exc)
+        self._refresh_ui(icon)
+
+    def _open_readme(self, icon, _item=None) -> None:
+        try:
+            self.integration.open_readme()
+        except Exception as exc:
+            logging.exception("Failed to open README: %s", exc)
+        self._refresh_ui(icon)
+
     def _quit(self, icon, _item=None) -> None:
+        self.shutdown()
+
+    def shutdown(self) -> None:
         self.engine.shutdown()
-        icon.stop()
+        self.engine.set_state_change_callback(None)
+        self.engine.set_quit_request_callback(None)
+        if self.icon is not None:
+            self.icon.stop()
 
 
 def parse_args() -> argparse.Namespace:
@@ -780,6 +1130,16 @@ def parse_args() -> argparse.Namespace:
         "--no-tray",
         action="store_true",
         help="run without the tray UI for development/debugging",
+    )
+    parser.add_argument(
+        "--startup-launch",
+        action="store_true",
+        help="run as an automatic startup launch and honor startup delay",
+    )
+    parser.add_argument(
+        "--panic-stop",
+        action="store_true",
+        help="kill the currently running HotCornerPy process using its PID file",
     )
     parser.add_argument(
         "--run-for-seconds",
@@ -796,6 +1156,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_logging(verbose: bool) -> None:
+    ensure_runtime_dir()
     handlers = [
         logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8"),
         logging.StreamHandler(),
@@ -823,17 +1184,73 @@ def run_console_mode(engine: HotCornersEngine, run_for_seconds: Optional[float])
 
 def main() -> None:
     args = parse_args()
+
+    if args.panic_stop:
+        raise SystemExit(panic_stop_running_instance())
+
     configure_logging(args.verbose)
+    integration = WindowsIntegration()
+    integration.ensure_recovery_artifacts()
+    write_pid_file()
 
-    engine = HotCornersEngine(dry_run=args.dry_run)
+    tray: Optional[TrayController] = None
+    shutdown_started = threading.Event()
+    console_ctrl_handler: Optional[HANDLER_ROUTINE] = None
 
-    if args.no_tray:
-        run_console_mode(engine, args.run_for_seconds)
-        return
+    try:
+        engine = HotCornersEngine(dry_run=args.dry_run)
 
-    engine.enable()
-    tray = TrayController(engine, auto_quit_after=args.run_for_seconds)
-    tray.run()
+        def request_shutdown(reason: int) -> None:
+            if shutdown_started.is_set():
+                return
+            shutdown_started.set()
+            logging.info("Received shutdown request %s, shutting down", reason)
+            if tray is not None:
+                tray.shutdown()
+            else:
+                engine.shutdown()
+
+        def handle_shutdown_signal(signum, _frame) -> None:
+            request_shutdown(int(signum))
+
+        try:
+            console_ctrl_handler = install_console_ctrl_handler(request_shutdown)
+        except Exception as exc:
+            logging.warning("Failed to install console control handler: %s", exc)
+
+        signal.signal(signal.SIGINT, handle_shutdown_signal)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, handle_shutdown_signal)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, handle_shutdown_signal)
+
+        if args.startup_launch:
+            delay_seconds = engine.startup_delay_seconds()
+            if delay_seconds > 0:
+                logging.info("Startup launch delay: %.1f seconds", delay_seconds)
+                time.sleep(delay_seconds)
+
+        if args.no_tray:
+            run_console_mode(engine, args.run_for_seconds)
+            return
+
+        engine.enable()
+        tray = TrayController(
+            engine=engine,
+            integration=integration,
+            auto_quit_after=args.run_for_seconds,
+        )
+        try:
+            tray.run()
+        except KeyboardInterrupt:
+            handle_shutdown_signal(signal.SIGINT, None)
+    finally:
+        if console_ctrl_handler is not None:
+            try:
+                kernel32.SetConsoleCtrlHandler(console_ctrl_handler, False)
+            except Exception:
+                pass
+        remove_pid_file()
 
 
 if __name__ == "__main__":
