@@ -1,0 +1,10 @@
+{
+  "corner_zone_px": 2,
+  "rearm_distance_px": 40,
+  "retrigger_guard_distance_px": 160,
+  "dwell_ms": 20,
+  "cooldown_ms": 400,
+  "click_suppression_ms": 150,
+  "monitor_refresh_ms": 300000,
+  "max_callback_errors": 5
+}
