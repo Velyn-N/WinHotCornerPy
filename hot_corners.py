@@ -1,13 +1,12 @@
 """
 GNOME-style top-left hot corners for Windows.
 
-This version uses a global low-level mouse hook, tracks the top-left corner of
-every active monitor, and adapts to monitor layout changes while running.
+The default runtime model is a tray-controlled background utility. A tray icon
+allows enabling/disabling the engine, reloading configuration, opening the local
+config file, and quitting the application.
 
 Configuration is loaded from `hot_corners_config.json` in the same directory if
 the file exists. Any missing or invalid values fall back to safe defaults.
-
-Exit with Ctrl+C.
 """
 
 from __future__ import annotations
@@ -57,7 +56,6 @@ HMONITOR = ctypes.c_void_p
 HDC = ctypes.c_void_p
 
 BUTTON_DOWN_MESSAGES = (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN)
-BUTTON_UP_MESSAGES = (WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP)
 
 DEFAULTS = {
     "corner_zone_px": 2,
@@ -256,31 +254,51 @@ class CornerVisitState:
     last_click_ms: int = 0
 
 
-class HotCornersApp:
-    def __init__(self, dry_run: bool, run_for_seconds: Optional[float]) -> None:
+class HotCornersEngine:
+    def __init__(self, dry_run: bool) -> None:
         self.dry_run = dry_run
-        self.run_for_seconds = run_for_seconds
-        self.stop_event = threading.Event()
-        self.trigger_event = threading.Event()
-        self.action_queue: "queue.Queue[str]" = queue.Queue()
         self.state_lock = threading.Lock()
         self.monitor_callback = MONITORENUMPROC(self._monitor_enum_proc)
 
         self.config = self._load_config()
         self.config_mtime: Optional[float] = None
-        self.callback_error_count = 0
-        self.feature_enabled = True
-
         self.monitors: List[MonitorCorner] = []
         self.states: Dict[Tuple[int, int, int, int], CornerVisitState] = {}
         self.last_position: Optional[Tuple[int, int]] = None
         self.last_global_trigger_ms = 0
         self.awaiting_corner_exit = False
         self.last_trigger_point: Optional[Tuple[int, int]] = None
+        self.callback_error_count = 0
+        self.failure_reason: Optional[str] = None
 
+        self.running = False
+        self.enabled = False
+        self.threads: List[threading.Thread] = []
+
+        self.stop_event = threading.Event()
+        self.trigger_event = threading.Event()
+        self.action_queue: "queue.Queue[str]" = queue.Queue()
         self.hook_handle = HHOOK()
         self.hook_callback = HOOKPROC(self._mouse_proc)
         self.hook_thread_id = 0
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.monotonic() * 1000)
+
+    def _reset_runtime_state(self) -> None:
+        self.stop_event = threading.Event()
+        self.trigger_event = threading.Event()
+        self.action_queue = queue.Queue()
+        self.threads = []
+        self.hook_handle = HHOOK()
+        self.hook_thread_id = 0
+        self.last_position = None
+        self.last_global_trigger_ms = 0
+        self.awaiting_corner_exit = False
+        self.last_trigger_point = None
+        self.callback_error_count = 0
+        self.failure_reason = None
 
     def _load_config(self) -> Config:
         values = dict(DEFAULTS)
@@ -317,7 +335,7 @@ class HotCornersApp:
 
         return Config(**validated)
 
-    def _refresh_config_if_needed(self, force: bool = False) -> None:
+    def reload_config(self, force: bool = False) -> None:
         try:
             current_mtime = os.path.getmtime(CONFIG_PATH)
         except OSError:
@@ -331,6 +349,101 @@ class HotCornersApp:
             self.config = config
         self.config_mtime = current_mtime
         logging.info("Configuration loaded: %s", config)
+
+    def ensure_config_file(self) -> None:
+        if os.path.exists(CONFIG_PATH):
+            return
+        with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+            json.dump(DEFAULTS, handle, indent=2)
+            handle.write("\n")
+        logging.info("Created default config file at %s", CONFIG_PATH)
+
+    def open_config_file(self) -> None:
+        self.ensure_config_file()
+        os.startfile(CONFIG_PATH)
+
+    def is_enabled(self) -> bool:
+        with self.state_lock:
+            return self.enabled
+
+    def is_running(self) -> bool:
+        with self.state_lock:
+            return self.running
+
+    def status_text(self) -> str:
+        with self.state_lock:
+            if self.enabled and self.running:
+                return "Enabled"
+            if self.failure_reason:
+                return f"Disabled ({self.failure_reason})"
+            return "Disabled"
+
+    def enable(self) -> None:
+        with self.state_lock:
+            if self.enabled:
+                return
+            self.enabled = True
+        self.start()
+
+    def disable(self, reason: str = "disabled") -> None:
+        with self.state_lock:
+            self.enabled = False
+            self.failure_reason = reason
+        self.stop()
+
+    def start(self) -> None:
+        with self.state_lock:
+            if self.running:
+                return
+            self.enabled = True
+            self.running = True
+
+        self._reset_runtime_state()
+        self.reload_config(force=True)
+        self._refresh_monitors()
+
+        self.threads = [
+            threading.Thread(target=self._action_loop, name="action-worker", daemon=True),
+            threading.Thread(target=self._trigger_loop, name="trigger-worker", daemon=True),
+            threading.Thread(target=self._monitor_refresh_loop, name="monitor-refresh", daemon=True),
+            threading.Thread(target=self._run_hook_loop, name="mouse-hook", daemon=True),
+        ]
+        for thread in self.threads:
+            thread.start()
+        logging.info("Hot corners engine started")
+
+    def stop(self) -> None:
+        self._request_stop(join=True)
+
+    def shutdown(self) -> None:
+        with self.state_lock:
+            self.enabled = False
+            self.failure_reason = None
+        self._request_stop(join=True)
+
+    def _request_stop(self, join: bool) -> None:
+        with self.state_lock:
+            if not self.running:
+                return
+
+        self.stop_event.set()
+        self.trigger_event.set()
+        self.action_queue.put("stop")
+        if self.hook_thread_id:
+            user32.PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0)
+
+        if join:
+            current = threading.current_thread()
+            for thread in self.threads:
+                if thread is current:
+                    continue
+                thread.join(timeout=2.0)
+            with self.state_lock:
+                self.running = False
+            logging.info("Hot corners engine stopped")
+
+    def _request_stop_async(self) -> None:
+        threading.Thread(target=self._request_stop, args=(True,), daemon=True).start()
 
     def _monitor_enum_proc(self, monitor_handle, _hdc, _rect, _lparam):
         info = MONITORINFO()
@@ -353,35 +466,20 @@ class HotCornersApp:
         self._enumerated_monitors: List[MonitorCorner] = []
         if not user32.EnumDisplayMonitors(None, None, self.monitor_callback, 0):
             raise ctypes.WinError(ctypes.get_last_error())
-        monitors = sorted(self._enumerated_monitors, key=lambda item: (item.top, item.left))
-        return monitors
+        return sorted(self._enumerated_monitors, key=lambda item: (item.top, item.left))
 
     def _refresh_monitors(self) -> None:
         monitors = self._enumerate_monitors()
         with self.state_lock:
             if monitors == self.monitors:
                 return
-
             existing_states = self.states
             self.monitors = monitors
             self.states = {
                 monitor.key: existing_states.get(monitor.key, CornerVisitState())
                 for monitor in monitors
             }
-
         logging.info("Active monitor topology: %s", [monitor.key for monitor in monitors])
-
-    def _disable_feature(self, reason: str) -> None:
-        with self.state_lock:
-            if not self.feature_enabled:
-                return
-            self.feature_enabled = False
-        logging.error("Disabling hot corners: %s", reason)
-        self.stop_event.set()
-        self.trigger_event.set()
-        self.action_queue.put("stop")
-        if self.hook_thread_id:
-            user32.PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0)
 
     def _record_callback_fault(self, exc: Exception) -> None:
         should_disable = False
@@ -392,7 +490,10 @@ class HotCornersApp:
             should_disable = count >= limit
         logging.exception("Mouse hook callback failed (%s/%s): %s", count, limit, exc)
         if should_disable:
-            self._disable_feature("too many callback failures")
+            with self.state_lock:
+                self.enabled = False
+                self.failure_reason = "hook fault"
+            self._request_stop_async()
 
     def _find_monitor_for_point(self, x: int, y: int, config: Config) -> Optional[MonitorCorner]:
         for monitor in self.monitors:
@@ -421,7 +522,7 @@ class HotCornersApp:
 
     def _update_corner_states(self, message: int, x: int, y: int, now_ms: int) -> None:
         with self.state_lock:
-            if not self.feature_enabled:
+            if not self.enabled:
                 return
 
             config = self.config
@@ -462,7 +563,6 @@ class HotCornersApp:
                 return
 
             state = self.states.setdefault(current_monitor.key, CornerVisitState())
-
             if message in BUTTON_DOWN_MESSAGES:
                 state.last_click_ms = now_ms
                 state.entry_ms = now_ms
@@ -488,7 +588,7 @@ class HotCornersApp:
             except Exception as exc:
                 self._record_callback_fault(exc)
 
-        return user32.CallNextHookEx(self.hook_handle, n_code, w_param, l_param)
+        return user32.CallNextHookEx(self.hook_handle, n_code, w_param, lParam:=l_param)
 
     def _run_hook_loop(self) -> None:
         try:
@@ -509,7 +609,10 @@ class HotCornersApp:
                 user32.DispatchMessageW(ctypes.byref(msg))
         except Exception as exc:
             logging.exception("Hook loop failed: %s", exc)
-            self._disable_feature("hook loop failed")
+            with self.state_lock:
+                self.enabled = False
+                self.failure_reason = "hook loop failed"
+            self._request_stop_async()
         finally:
             if self.hook_handle:
                 user32.UnhookWindowsHookEx(self.hook_handle)
@@ -523,7 +626,7 @@ class HotCornersApp:
             if self.stop_event.wait(interval_seconds):
                 break
             try:
-                self._refresh_config_if_needed()
+                self.reload_config()
                 self._refresh_monitors()
             except Exception as exc:
                 logging.exception("Monitor refresh failed: %s", exc)
@@ -534,16 +637,15 @@ class HotCornersApp:
             self.trigger_event.clear()
 
             with self.state_lock:
-                if not self.feature_enabled:
+                if not self.enabled:
                     continue
 
                 now_ms = self._now_ms()
                 config = self.config
-
                 if now_ms - self.last_global_trigger_ms < config.cooldown_ms:
                     continue
 
-                trigger_key: Optional[Tuple[int, int, int, int]] = None
+                should_trigger = False
                 for monitor in self.monitors:
                     state = self.states.setdefault(monitor.key, CornerVisitState())
                     if not state.inside or state.triggered:
@@ -556,10 +658,10 @@ class HotCornersApp:
                     self.last_global_trigger_ms = now_ms
                     self.awaiting_corner_exit = True
                     self.last_trigger_point = self.last_position
-                    trigger_key = monitor.key
+                    should_trigger = True
                     break
 
-            if trigger_key is not None:
+            if should_trigger:
                 self.action_queue.put("trigger")
 
     def _action_loop(self) -> None:
@@ -587,56 +689,84 @@ class HotCornersApp:
         user32.keybd_event(VK_TAB, 0, KEYEVENTF_KEYUP, 0)
         user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
 
-    def run(self) -> None:
-        self._refresh_config_if_needed(force=True)
-        self._refresh_monitors()
 
-        logging.info(
-            "Starting hot corners (%s mode)",
-            "dry-run" if self.dry_run else "live",
+class TrayController:
+    def __init__(self, engine: HotCornersEngine, auto_quit_after: Optional[float]) -> None:
+        self.engine = engine
+        self.auto_quit_after = auto_quit_after
+        self.icon = None
+
+    def run(self) -> None:
+        import pystray
+
+        self.icon = pystray.Icon(
+            "HotCornerPy",
+            self._build_icon_image(),
+            self._title(),
+            menu=pystray.Menu(
+                pystray.MenuItem(self._toggle_text, self._toggle_enabled),
+                pystray.MenuItem("Reload Config", self._reload_config),
+                pystray.MenuItem("Open Config File", self._open_config),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Quit", self._quit),
+            ),
         )
 
-        threads = [
-            threading.Thread(target=self._action_loop, name="action-worker", daemon=True),
-            threading.Thread(target=self._trigger_loop, name="trigger-worker", daemon=True),
-            threading.Thread(target=self._monitor_refresh_loop, name="monitor-refresh", daemon=True),
-            threading.Thread(target=self._run_hook_loop, name="mouse-hook", daemon=True),
-        ]
+        if self.auto_quit_after is not None:
+            threading.Thread(target=self._auto_quit, name="tray-auto-quit", daemon=True).start()
 
-        for thread in threads:
-            thread.start()
+        self.icon.run()
 
-        started_at = time.monotonic()
-        try:
-            while not self.stop_event.is_set():
-                if self.run_for_seconds is not None:
-                    if time.monotonic() - started_at >= self.run_for_seconds:
-                        logging.info("Run duration reached, stopping")
-                        break
+    def _auto_quit(self) -> None:
+        time.sleep(self.auto_quit_after)
+        if self.icon is not None:
+            self._quit(self.icon)
 
-                hook_thread = threads[-1]
-                if not hook_thread.is_alive():
-                    logging.error("Hook thread stopped unexpectedly")
-                    break
-
-                time.sleep(0.2)
-        except KeyboardInterrupt:
-            logging.info("Ctrl+C received, stopping")
-        finally:
-            self.stop_event.set()
-            self.trigger_event.set()
-            self.action_queue.put("stop")
-            if self.hook_thread_id:
-                user32.PostThreadMessageW(self.hook_thread_id, WM_QUIT, 0, 0)
-
-            for thread in threads:
-                thread.join(timeout=2.0)
-
-            logging.info("Hot corners stopped")
+    def _title(self) -> str:
+        return f"HotCornerPy ({self.engine.status_text()})"
 
     @staticmethod
-    def _now_ms() -> int:
-        return int(time.monotonic() * 1000)
+    def _build_icon_image():
+        from PIL import Image, ImageDraw
+
+        size = 64
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        color = (0, 130, 90, 255)
+        draw.rectangle([0, 0, 36, 9], fill=color)
+        draw.rectangle([0, 0, 9, 36], fill=color)
+        return image
+
+    def _refresh_ui(self, icon) -> None:
+        icon.title = self._title()
+        icon.update_menu()
+
+    def _toggle_text(self, _item) -> str:
+        if self.engine.is_enabled():
+            return "Disable Hot Corners"
+        return "Enable Hot Corners"
+
+    def _toggle_enabled(self, icon, _item=None) -> None:
+        if self.engine.is_enabled():
+            self.engine.disable("disabled by user")
+        else:
+            self.engine.enable()
+        self._refresh_ui(icon)
+
+    def _reload_config(self, icon, _item=None) -> None:
+        self.engine.reload_config(force=True)
+        self._refresh_ui(icon)
+
+    def _open_config(self, icon, _item=None) -> None:
+        try:
+            self.engine.open_config_file()
+        except Exception as exc:
+            logging.exception("Failed to open config file: %s", exc)
+        self._refresh_ui(icon)
+
+    def _quit(self, icon, _item=None) -> None:
+        self.engine.shutdown()
+        icon.stop()
 
 
 def parse_args() -> argparse.Namespace:
@@ -645,6 +775,11 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="capture events and evaluate triggers without sending Win+Tab",
+    )
+    parser.add_argument(
+        "--no-tray",
+        action="store_true",
+        help="run without the tray UI for development/debugging",
     )
     parser.add_argument(
         "--run-for-seconds",
@@ -672,11 +807,33 @@ def configure_logging(verbose: bool) -> None:
     )
 
 
+def run_console_mode(engine: HotCornersEngine, run_for_seconds: Optional[float]) -> None:
+    engine.enable()
+    started_at = time.monotonic()
+    try:
+        while engine.is_running():
+            if run_for_seconds is not None and time.monotonic() - started_at >= run_for_seconds:
+                break
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        logging.info("Ctrl+C received, stopping")
+    finally:
+        engine.shutdown()
+
+
 def main() -> None:
     args = parse_args()
     configure_logging(args.verbose)
-    app = HotCornersApp(dry_run=args.dry_run, run_for_seconds=args.run_for_seconds)
-    app.run()
+
+    engine = HotCornersEngine(dry_run=args.dry_run)
+
+    if args.no_tray:
+        run_console_mode(engine, args.run_for_seconds)
+        return
+
+    engine.enable()
+    tray = TrayController(engine, auto_quit_after=args.run_for_seconds)
+    tray.run()
 
 
 if __name__ == "__main__":
